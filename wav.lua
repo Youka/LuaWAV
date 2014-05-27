@@ -16,10 +16,10 @@
 	- get_sample_from_ms(ms)
 	- get_ms_from_sample(sample)
 	- get_min_max_amplitude()
-	- get_samples_interlaced(n)
-	- get_samples(n)
 	- get_position()
 	- set_position(pos)
+	- get_samples_interlaced(n)
+	- get_samples(n)
 	On writing, following methods are callable:
 	- init(channels_number, sample_rate, bits_per_sample)
 	- write_samples_interlaced(samples)
@@ -182,6 +182,26 @@ function wav(filename, mode)
 				local half_level = 2^bits_per_sample / 2
 				return -half_level, half_level - 1
 			end,
+			get_position = function()
+				if not block_align then
+					error("no format informations available", 2)
+				elseif not data_begin then
+					error("no samples available", 2)
+				end
+				return (file:seek() - data_begin) / block_align
+			end,
+			set_position = function(pos)
+				if not isint(pos) or pos < 0 then
+					error("positive integer expected", 2)
+				elseif not block_align then
+					error("no format informations available", 2)
+				elseif not data_begin then
+					error("no samples available", 2)
+				elseif data_begin + pos * block_align > data_end then
+					error("tried to set position behind data end", 2)
+				end
+				file:seek("set", data_begin + pos * block_align)
+			end,
 			get_samples_interlaced = function(n)
 				if not isint(n) or n <= 0 then
 					error("positive integer greater zero expected", 2)
@@ -235,26 +255,6 @@ function wav(filename, mode)
 					output[c] = channel_samples
 				end
 				return output
-			end,
-			get_position = function()
-				if not block_align then
-					error("no format informations available", 2)
-				elseif not data_begin then
-					error("no samples available", 2)
-				end
-				return (file:seek() - data_begin) / block_align
-			end,
-			set_position = function(pos)
-				if not isint(pos) or pos < 0 then
-					error("positive integer expected", 2)
-				elseif not block_align then
-					error("no format informations available", 2)
-				elseif not data_begin then
-					error("no samples available", 2)
-				elseif data_begin + pos * block_align > data_end then
-					error("tried to set position behind data end", 2)
-				end
-				file:seek("set", data_begin + pos * block_align)
 			end
 		}
 		return obj
@@ -319,22 +319,22 @@ function wav(filename, mode)
 				if bytes_per_sample == 1 then
 					for i=1, samples_n do
 						sample = samples[i]
-						file:write(ntob(sample < 0 and sample + 255 or sample, 1))
+						file:write(ntob(sample < 0 and sample + 256 or sample, 1))
 					end
 				elseif bytes_per_sample == 2 then
 					for i=1, samples_n do
 						sample = samples[i]
-						file:write(ntob(sample < 0 and sample + 65535 or sample, 2))
+						file:write(ntob(sample < 0 and sample + 65536 or sample, 2))
 					end
 				elseif bytes_per_sample == 3 then
 					for i=1, samples_n do
 						sample = samples[i]
-						file:write(ntob(sample < 0 and sample + 16777215 or sample, 3))
+						file:write(ntob(sample < 0 and sample + 16777216 or sample, 3))
 					end
 				else	-- if bytes_per_sample == 4 then
 					for i=1, samples_n do
 						sample = samples[i]
-						file:write(ntob(sample < 0 and sample + 4294967295 or sample, 3))
+						file:write(ntob(sample < 0 and sample + 4294967296 or sample, 4))
 					end
 				end
 			end,
@@ -353,7 +353,7 @@ function wav(filename, mode)
 				end
 				-- Save file size
 				file:seek("set", 4)
-				file:write(ntob(file_size, 4))
+				file:write(ntob(file_size - 8, 4))
 				-- Save data size
 				file:seek("set", 40)
 				file:write(ntob(file_size - 44, 4))
@@ -375,9 +375,20 @@ function samples_transform(samples)
 	if type(samples) ~= "table" then
 		error("table expected", 2)
 	end
+	do
+		local n = #samples
+		while n % 2 == 0 and n > 1 do
+			n = n / 2
+		end
+		if n ~= 1 then
+			error("table size have to be a power of two", 2)
+		end
+	end
 	for _, sample in ipairs(samples) do
 		if type(sample) ~= "number" then
-			error("elements have to be numbers", 2)
+			error("table have only to contain numbers", 2)
+		elseif sample > 1 or sample < -1 then
+			error("numbers should be normalized / limited to -1 until 1", 2)
 		end
 	end
 	-- Complex numbers
@@ -452,4 +463,33 @@ function samples_transform(samples)
 		data[i] = magnitude(data[i])
 	end
 	return data
+end
+
+--[[
+	Convert samples into an ASS (Advanced Substation Alpha) subtitle shape code.
+]]
+function audio_to_ass(samples, wave_width, wave_height_scale, wave_thickness)
+	-- Check function parameters
+	if type(samples) ~= "table" or not samples[1] or
+		type(wave_width) ~= "number" or wave_width <= 0 or
+		type(wave_height_scale) ~= "number" or
+		type(wave_thickness) ~= "number" or wave_thickness <= 0 then
+		error("samples table, positive wave width, height scale and thickness expected", 2)
+	end
+	for _, sample in ipairs(samples) do
+		if type(sample) ~= "number" then
+			error("table have only to contain numbers", 2)
+		end
+	end
+	-- Better fitting forms of known variables for most use
+	local thick2, samples_n = wave_thickness / 2, #samples
+	-- Build shape
+	local shape = string.format("m 0 %d l", samples[1] * wave_height_scale - thick2)
+	for i=2, samples_n do
+		shape = string.format("%s %d %d", shape, (i-1) / (samples_n-1) * wave_width, samples[i] * wave_height_scale - thick2)
+	end
+	for i=samples_n, 1, -1 do
+		shape = string.format("%s %d %d", shape, (i-1) / (samples_n-1) * wave_width, samples[i] * wave_height_scale + thick2)
+	end
+	return shape
 end
